@@ -1395,6 +1395,8 @@ These ship in the next version.
 - ✅ Internet Archive: a download that needs your account keeps the browser's sign-in on its way to
   archive.org's storage servers (thanks to [@arifrhm](https://github.com/arifrhm))
   ([#1298](https://github.com/anefzaoui/misterdownloadmanager/issues/1298))
+- ✅ Persian: a native speaker's review of the first 23 texts (thanks to
+  [@RedemptionMHA](https://github.com/RedemptionMHA))
 
 ## Being worked on
 
