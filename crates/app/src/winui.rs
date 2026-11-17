@@ -1284,21 +1284,35 @@ pub fn reachable_rows(n: usize, first: usize, page: usize) -> std::ops::Range<us
 /// How many rows of a list a screen reader reaches at most ([`reachable_rows`]).
 pub const A11Y_ROWS: usize = 300;
 
-/// The row of `rows` (widget ids `id_of(i)`) a screen reader asked to scroll into view, or to
-/// select (AccessKit's click), this frame.
+/// The row of `rows` (widget ids `id_of(i)`) a screen reader asked to scroll into view, to
+/// select (AccessKit's click) or to move the focus to, this frame.
 pub fn row_asked_for(
     ui: &Ui,
     rows: std::ops::Range<usize>,
     id_of: impl Fn(usize) -> egui::Id,
 ) -> Option<usize> {
     use egui::accesskit::Action;
+    row_asked(
+        ui,
+        rows,
+        id_of,
+        &[Action::ScrollIntoView, Action::Click, Action::Focus],
+    )
+}
+
+/// The row of `rows` (widget ids `id_of(i)`) a screen reader asked for one of `actions` this
+/// frame.
+pub fn row_asked(
+    ui: &Ui,
+    rows: std::ops::Range<usize>,
+    id_of: impl Fn(usize) -> egui::Id,
+    actions: &[egui::accesskit::Action],
+) -> Option<usize> {
     let targets: Vec<egui::accesskit::NodeId> = ui.input(|i| {
         i.events
             .iter()
             .filter_map(|e| match e {
-                egui::Event::AccessKitActionRequest(r)
-                    if matches!(r.action, Action::ScrollIntoView | Action::Click) =>
-                {
+                egui::Event::AccessKitActionRequest(r) if actions.contains(&r.action) => {
                     Some(r.target_node)
                 }
                 _ => None,
@@ -1310,6 +1324,46 @@ pub fn row_asked_for(
     }
     rows.into_iter()
         .find(|i| targets.contains(&id_of(*i).accesskit_id()))
+}
+
+/// Makes `id`'s node one a screen reader can move the focus to (UI Automation's
+/// IsKeyboardFocusable, AT-SPI's focusable) in a part of a window that keeps its keys itself
+/// rather than through egui's focus (the main window's toolbar, Categories tree and download
+/// list: egui's focus would take Tab and the arrows from them), and says whether one asked to
+/// move it there this pass (UI Automation's SetFocus): the caller then gives that part the
+/// keys (#1190).
+pub fn focus_target(ctx: &egui::Context, id: egui::Id) -> bool {
+    use egui::accesskit::Action;
+    ctx.accesskit_node_builder(id, |n| n.add_action(Action::Focus));
+    ctx.input(|i| i.has_accesskit_action_request(id, Action::Focus))
+}
+
+fn keys_with_key(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique(("keys-with", ctx.viewport_id()))
+}
+
+/// In such a part, the item that has the keys this pass (the download list's focused row, the
+/// tree's selected node, the toolbar's button): what a screen reader is to say has the focus,
+/// and follow as the keys move it. At the end of the pass,
+/// [`crate::chrome::tell_screen_readers`] makes it the active descendant of what has the
+/// accessibility focus (the window's own node: egui's focus is elsewhere), unless a menu opened
+/// from the keyboard is shown (#1190).
+pub fn keys_with(ctx: &egui::Context, item: egui::Id) {
+    // The key first: asking the context inside its data lock deadlocks.
+    let (key, pass) = (keys_with_key(ctx), ctx.cumulative_pass_nr());
+    ctx.data_mut(|d| d.insert_temp(key, (item, pass)));
+}
+
+/// The item [`keys_with`] named this pass, taken.
+pub fn take_keys_with(ctx: &egui::Context) -> Option<egui::Id> {
+    let (key, pass) = (keys_with_key(ctx), ctx.cumulative_pass_nr());
+    ctx.data_mut(|d| {
+        let item = d.get_temp::<(egui::Id, u64)>(key);
+        d.remove::<(egui::Id, u64)>(key);
+        item
+    })
+    .filter(|(_, at)| *at == pass)
+    .map(|(item, _)| item)
 }
 
 /// The one list of whole rows in a box (a dialog's list, a tree drawn as rows): its frame,
@@ -1440,6 +1494,16 @@ pub fn row_list(
     // Rows out of view lie above or below it, clipped: nothing of them shows or takes a click.
     rows_ui.set_clip_rect(rect(area).intersect(ui.clip_rect()));
     let shown = st.first..n.min(st.first + page);
+    // While the list has the keys, its selected row is what a screen reader says has the focus,
+    // and follows as the keys move it (#1190: it said only "list").
+    if focused
+        && let Some(s) = st.selected
+        && reach.contains(&s)
+    {
+        let row = id.with(s).accesskit_id();
+        ui.ctx()
+            .accesskit_node_builder(resp.id, |node| node.set_active_descendant(row));
+    }
     for i in reach {
         let in_view = shown.contains(&i);
         let top = inner.top() + 1.0 + row_h * (i as f32 - st.first as f32);
@@ -1464,7 +1528,10 @@ pub fn row_list(
         if let Some(f) = fill {
             clip.rect_filled(rect(row), 0.0, f);
         }
-        if r.clicked() || r.secondary_clicked() || r.double_clicked() {
+        // A screen reader moving the focus to a row (#1190) selects it, as a click does, and
+        // gives the list the keys.
+        let focus_asked = focus_target(ui.ctx(), r.id);
+        if r.clicked() || r.secondary_clicked() || r.double_clicked() || focus_asked {
             resp.request_focus();
             if st.selected != Some(i) {
                 st.selected = Some(i);
@@ -2317,7 +2384,7 @@ fn edit_text_with(
         // The caret in the box's own ink: egui's default (a pale blue in its dark style) was
         // all but invisible on a light box.
         ui.visuals_mut().text_cursor.stroke.color = color;
-        ui.add_enabled_ui(enabled, |ui| ui.add(te)).inner
+        without_alt_text(ui, |ui| ui.add_enabled_ui(enabled, |ui| ui.add(te)).inner)
     });
     keep_selection_on_right_click(&resp, frame_right, before);
     pass_focus_on(ui, &resp, enabled);
@@ -2334,6 +2401,46 @@ fn edit_text_with(
         edit_menu(&resp, value, password, false);
     }
     resp
+}
+
+/// Draws a text box with `add`, without the text typed with Alt held: Alt+letter is an access
+/// key (a dialog's button, the menu bar), never typing, as in Windows' and Linux's boxes.
+/// egui-winit sends Alt+S as the key and the text "s": the button took the key, the focused box
+/// typed the "s". The text stays in the input for the access keys read after the box
+/// ([`mnemonic_pressed`] takes a letter of another script by it).
+fn without_alt_text<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    // Not on macOS: Option (its Alt) is how its keyboards type letters (Option+S is "ß",
+    // Option+E an accent), which a box there takes as Mac boxes do.
+    let held: Vec<egui::Event> = if cfg!(target_os = "macos") {
+        Vec::new()
+    } else {
+        ui.input_mut(|i| {
+            // A text comes right after the key that typed it, which says what was held.
+            let mut with_alt = false;
+            let mut held = Vec::new();
+            for e in std::mem::take(&mut i.events) {
+                match e {
+                    egui::Event::Key {
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        // Ctrl+Alt is AltGr on Windows, which types (@, €...).
+                        with_alt = modifiers.alt && !modifiers.ctrl && !modifiers.command;
+                        i.events.push(e);
+                    }
+                    egui::Event::Text(_) if with_alt => held.push(e),
+                    e => i.events.push(e),
+                }
+            }
+            held
+        })
+    };
+    let out = add(ui);
+    if !held.is_empty() {
+        ui.input_mut(|i| i.events.extend(held));
+    }
+    out
 }
 
 /// A text box's right-click menu, each item enabled or not.
@@ -3764,7 +3871,7 @@ pub fn multiline_light(
                 .desired_width(inner.width())
                 .desired_rows(3);
             let before = selection_now(ui.ctx(), text_id);
-            let resp = ui.add(te);
+            let resp = without_alt_text(ui, |ui| ui.add(te));
             keep_selection_on_right_click(&resp, false, before);
             edit_menu(&resp, value, false, true);
             // Enter here is a new line, not the dialog's OK.
@@ -3929,8 +4036,10 @@ fn button_face(
     if let Some(before) = mnemonic
         && let Some(letter) = shown[before.len()..].chars().next()
     {
-        // Underlined as the menus are (always dark; light once the keyboard is in use), while
-        // Alt+letter always works.
+        // Underlined as the menus are (always in a dark classic look; elsewhere once the
+        // keyboard is in use: Alt pressed in this window, as in the main one), while Alt+letter
+        // always works.
+        cues_on_alt(ui);
         if crate::chrome::cues(ui.ctx()) {
             let (x0, x1) = char_span(p, &tahoma(), &shown, before.chars().count(), drawn);
             hline(p, x0, x1, baseline + 3.0, face.text);
@@ -3939,7 +4048,10 @@ fn button_face(
     }
     let resp = if pressed_by_key {
         let mut r = resp;
-        r.flags.insert(egui::response::Flags::CLICKED);
+        // A click as egui's own keyboard clicks are (Space or Enter on the focused button):
+        // `clicked()` reads the plain CLICKED flag only with a pointer click in the same pass,
+        // so Alt+letter pressed nothing anywhere.
+        r.flags.insert(egui::response::Flags::FAKE_PRIMARY_CLICKED);
         r
     } else {
         resp
@@ -4137,9 +4249,47 @@ fn button_colors_in(
     }
 }
 
+/// Alt as an access key's modifier: without Ctrl (Ctrl+Alt is AltGr on Windows, which types).
+fn access_alt(m: &egui::Modifiers) -> bool {
+    m.alt && !m.ctrl && !m.command
+}
+
+/// Whether this pass's input holds Alt, alone or with a key. Read from the events too, not only
+/// from the pass's modifiers: Alt pressed and let go within one pass (X11 often sends a key and
+/// Alt's release together; a screen reader passes a key on with its release, #328) never shows
+/// in those.
+fn alt_in(i: &egui::InputState) -> bool {
+    access_alt(&i.modifiers)
+        || i.events.iter().any(|e| match e {
+            egui::Event::ModifiersChanged(m) => access_alt(m),
+            egui::Event::Key {
+                pressed: true,
+                modifiers,
+                ..
+            } => access_alt(modifiers),
+            _ => false,
+        })
+}
+
+/// Alt in a window with access letters (a dialog's buttons): the keyboard is in use, so the
+/// letters are underlined from now on in every look (Windows' rule; the main window's menu bar
+/// does the same for its Alt). Not on macOS, whose apps have no access keys.
+fn cues_on_alt(ui: &Ui) {
+    if !cfg!(target_os = "macos") && ui.input(alt_in) {
+        crate::chrome::show_cues(ui.ctx());
+    }
+}
+
 /// Alt+`letter` was pressed (and is taken): Latin letters as egui keys, other scripts (Cyrillic,
 /// Greek, Arabic…) as the text typed with Alt held.
+///
+/// Never on macOS: its apps have no access keys (the menu bar there takes no Alt+letter either,
+/// app.rs), and Option, its Alt, types letters (Option+C is "ç"), which the focused box takes
+/// (`without_alt_text`): the same keys must not also press a button.
 pub fn mnemonic_pressed(ui: &Ui, letter: char) -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
     let upper: String = letter.to_uppercase().collect();
     if let Some(key) = egui::Key::from_name(&upper)
         && ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, key))
@@ -4148,11 +4298,25 @@ pub fn mnemonic_pressed(ui: &Ui, letter: char) -> bool {
     }
     let lower: String = letter.to_lowercase().collect();
     ui.input_mut(|i| {
-        let alt = i.modifiers.alt;
-        let at = i
-            .events
-            .iter()
-            .position(|e| matches!(e, egui::Event::Text(t) if alt && t.to_lowercase() == lower));
+        // A text comes after the key that typed it, which says whether Alt was held: on X11 Alt
+        // is often let go in the same pass, and the pass's own modifiers no longer have it.
+        let pass_alt = access_alt(&i.modifiers);
+        let mut with_alt = false;
+        let mut at = None;
+        for (k, e) in i.events.iter().enumerate() {
+            match e {
+                egui::Event::Key {
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => with_alt = access_alt(modifiers),
+                egui::Event::Text(t) if (with_alt || pass_alt) && t.to_lowercase() == lower => {
+                    at = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+        }
         at.map(|k| i.events.remove(k)).is_some()
     })
 }
@@ -7208,6 +7372,10 @@ mod tests {
     struct Drawn {
         rows: Vec<(egui::accesskit::NodeId, String, usize, usize)>,
         list_children: usize,
+        /// Rows a screen reader can move its focus to (#1190).
+        focusable_rows: usize,
+        /// The list's active descendant: the row a screen reader says has the focus.
+        active: Option<egui::accesskit::NodeId>,
         st: RowList,
         events: RowEvents,
         took: std::time::Duration,
@@ -7254,15 +7422,24 @@ mod tests {
                 .sum()
         }
         let mut list_children = 0;
+        let mut active = None;
+        let mut focusable_rows = 0;
         for (id, node) in &update.nodes {
             match node.role() {
-                egui::accesskit::Role::ListBoxOption => rows.push((
-                    *id,
-                    node.label().unwrap_or_default().to_owned(),
-                    node.position_in_set().unwrap_or(0),
-                    node.size_of_set().unwrap_or(0),
-                )),
-                egui::accesskit::Role::ListBox => list_children = options(&by_id, node),
+                egui::accesskit::Role::ListBoxOption => {
+                    focusable_rows +=
+                        usize::from(node.supports_action(egui::accesskit::Action::Focus));
+                    rows.push((
+                        *id,
+                        node.label().unwrap_or_default().to_owned(),
+                        node.position_in_set().unwrap_or(0),
+                        node.size_of_set().unwrap_or(0),
+                    ))
+                }
+                egui::accesskit::Role::ListBox => {
+                    list_children = options(&by_id, node);
+                    active = node.active_descendant();
+                }
                 _ => {}
             }
         }
@@ -7270,6 +7447,8 @@ mod tests {
         Drawn {
             rows,
             list_children,
+            focusable_rows,
+            active,
             st,
             events: ev,
             took,
@@ -7314,6 +7493,37 @@ mod tests {
         assert_eq!((d.st.selected, d.events.picked), (Some(2), Some(2)));
         let d = draw_list(&ctx, 40, d.st, vec![]);
         assert!((d.st.first..d.st.first + 5).contains(&2), "{:?}", d.st);
+    }
+
+    /// #1190: a list's rows take a screen reader's focus (the row selected, the list given the
+    /// keys), and while the list has them its selected row is its active descendant: what the
+    /// reader says has the focus, followed as the keys move it.
+    #[test]
+    fn a_row_takes_the_focus_and_the_reader_follows_the_selection() {
+        use egui::accesskit::Action;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let d = draw_list(&ctx, 10, RowList::default(), vec![]);
+        let d = draw_list(&ctx, 10, d.st, vec![]);
+        assert_eq!(d.focusable_rows, 10);
+        assert_eq!(d.active, None, "not focused: nothing followed");
+        let row3 = d.rows[3].0;
+        let d = draw_list(&ctx, 10, d.st, vec![ask(row3, Action::Focus)]);
+        assert_eq!((d.st.selected, d.events.picked), (Some(3), Some(3)));
+        let d = draw_list(&ctx, 10, d.st, vec![]);
+        assert!(d.events.focused, "the list has the keys");
+        assert_eq!(d.active, Some(row3));
+        let down = egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let d = draw_list(&ctx, 10, d.st, vec![down]);
+        assert_eq!(d.st.selected, Some(4));
+        let d = draw_list(&ctx, 10, d.st, vec![]);
+        assert_eq!(d.active, Some(d.rows[4].0));
     }
 
     /// #111: a list of thousands (a playlist, #69) exposes a bounded window of rows around the
@@ -7574,6 +7784,9 @@ mod tests {
         t: f64,
         /// A multi-line box ([`multiline_light`]) instead.
         lines: bool,
+        /// A dialog's access letter after the box (a button's "&Start"): Alt+it presses it; how
+        /// many times it has.
+        access: Option<(char, u32)>,
     }
 
     impl TextBoxRun {
@@ -7596,6 +7809,7 @@ mod tests {
                 id: None,
                 t: 0.0,
                 lines,
+                access: None,
             };
             run.pass(Vec::new());
             run
@@ -7610,12 +7824,18 @@ mod tests {
                 ..Default::default()
             };
             let (rc, value, id, lines) = (self.rc, &mut self.value, &mut self.id, self.lines);
+            let access = &mut self.access;
             let mut out = self.ctx.run_ui(raw, |ui| {
                 *id = Some(if lines {
                     multiline_light(ui, rc, value, "t1084", true).id
                 } else {
                     edit(ui, rc, value, true, false).id
                 });
+                if let Some((letter, presses)) = access
+                    && mnemonic_pressed(ui, *letter)
+                {
+                    *presses += 1;
+                }
             });
             out.textures_delta.clear();
             out.platform_output
@@ -7683,6 +7903,23 @@ mod tests {
             copied
         }
 
+        /// A key as the system sends a typed one: the key, then the text it types (egui-winit
+        /// sends both for a letter), with `modifiers` held.
+        fn typed(&mut self, key: egui::Key, text: &str, modifiers: egui::Modifiers) {
+            let mut events = vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }];
+            if !text.is_empty() {
+                events.push(egui::Event::Text(text.to_owned()));
+            }
+            self.pass(events);
+            self.pass(Vec::new());
+        }
+
         /// The selection, in characters (lo, hi).
         fn selection(&self) -> (usize, usize) {
             let r = egui::TextEdit::load_state(&self.ctx, self.id.expect("drawn"))
@@ -7737,6 +7974,283 @@ example.org"; // values typed in, not texts to translate
         b.click(at, Secondary);
         assert_eq!(b.selection(), (0, text.chars().count()));
         assert_eq!(b.choose(egui::Key::C), [text]);
+    }
+
+    /// An open menu takes the keys whole: its item's letter, pressed as the system sends it (the
+    /// key, then the text it types), runs the item and types nothing in the box under the menu,
+    /// as in Windows' boxes (the "p" of Paste was typed in the box too). The arrows move in the
+    /// menu, not the box's caret.
+    #[test]
+    fn a_menu_letter_runs_its_item_and_types_nothing() {
+        use egui::PointerButton::{Primary, Secondary};
+        let text = "https://example.com/files/archive.zip"; // a value typed in, not a text to translate
+        let n = text.chars().count();
+        let mut b = TextBoxRun::new(text);
+        let rc = b.rc;
+        let at = pos2(rc.left() + 60.0, baseline_in(rc.top(), rc.height()) - 4.0);
+        b.click(at, Primary);
+        // The menu, the arrows, Escape: the box as it was, its caret where it was.
+        b.click(at, Secondary);
+        let caret = b.selection();
+        assert!(caret.0 > 0 && caret.0 < n, "{caret:?}");
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::ArrowLeft,
+            egui::Key::Escape,
+        ] {
+            b.typed(key, "", Default::default());
+        }
+        assert_eq!(b.value, text);
+        assert_eq!(b.selection(), caret, "the arrows were the menu's");
+        // The menu, "a" for Select all: all of it selected, no "a" typed.
+        b.click(at, Secondary);
+        b.typed(egui::Key::A, "a", Default::default());
+        assert_eq!(b.value, text, "nothing typed");
+        assert_eq!(b.selection(), (0, n));
+        // Once it is closed, typing types again.
+        b.typed(egui::Key::X, "x", Default::default());
+        assert_eq!(b.value, "x");
+    }
+
+    /// An item's letter in another script (Arabic's "&لصق", Russian's "&Вставить") is the text
+    /// its key types; egui names the key by the Latin letter in its place (egui-winit's
+    /// fallback), which no item has.
+    #[test]
+    fn a_menu_letter_of_another_script_runs_its_item() {
+        use crate::chrome::{MenuEntry, PopupResult};
+        // Labels through names, so tools/i18n/extract.py doesn't take them for texts to translate.
+        let [first, second] = ["\u{644}\u{635}&\u{642}", "&\u{644}\u{635}\u{642}"];
+        let entries: Vec<MenuEntry<u8>> = vec![
+            MenuEntry::Item(first, 0, true, false),
+            MenuEntry::Item(second, 1, true, false),
+        ];
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut pass = |events: Vec<egui::Event>| {
+            t += 0.05;
+            let raw = egui::RawInput {
+                time: Some(t),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            let mut chosen = None;
+            let mut out = ctx.run_ui(raw, |ui| {
+                if let PopupResult::Chosen(c) = crate::chrome::popup(
+                    ui.ctx(),
+                    crate::chrome::MenuKind::Context,
+                    "t-script",
+                    pos2(100.0, 100.0),
+                    &entries,
+                    &|_| None,
+                ) {
+                    chosen = Some(c);
+                }
+            });
+            out.textures_delta.clear();
+            chosen
+        };
+        assert_eq!(pass(Vec::new()), None);
+        assert_eq!(pass(Vec::new()), None);
+        // On an Arabic keyboard "ل" (U+0644) is on G's key.
+        let chosen = pass(vec![
+            egui::Event::Key {
+                key: egui::Key::G,
+                physical_key: Some(egui::Key::G),
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+            egui::Event::Text("\u{644}".into()),
+        ]);
+        assert_eq!(chosen, Some(1));
+    }
+
+    /// Alt+letter is a dialog's access key, never typing (Windows' and Linux's boxes type nothing
+    /// with Alt held): the focused box keeps its text, the button is pressed once.
+    #[test]
+    fn alt_and_a_letter_presses_the_button_and_types_nothing() {
+        use egui::PointerButton::Primary;
+        let text = "archive.zip"; // a value typed in, not a text to translate
+        let mut b = TextBoxRun::new(text);
+        b.access = Some(('s', 0));
+        let rc = b.rc;
+        b.click(
+            pos2(rc.left() + 30.0, baseline_in(rc.top(), rc.height()) - 4.0),
+            Primary,
+        );
+        b.typed(egui::Key::S, "s", egui::Modifiers::ALT);
+        // macOS: Option+letter types a letter (Option+S is "ß"), which its boxes take, and
+        // presses nothing (no access keys there).
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(b.access, Some(('s', 1)));
+            assert_eq!(b.value, text, "nothing typed");
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(b.access, Some(('s', 0)));
+    }
+
+    /// A dialog's "&Close" button ([`button_light`]) drawn pass after pass, one pass per entry
+    /// of `passes` after a first empty one: whether it was clicked in any of them, and whether
+    /// the keyboard cues (the underlined letters) were turned on.
+    fn close_by_keys(kind: ButtonKind, passes: Vec<Vec<egui::Event>>) -> (bool, bool) {
+        button_by_keys("&Close", kind, passes)
+    }
+
+    /// [`close_by_keys`] for a button labelled `label`.
+    fn button_by_keys(
+        label: &str,
+        kind: ButtonKind,
+        passes: Vec<Vec<egui::Event>>,
+    ) -> (bool, bool) {
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        install_fonts(&mut defs, None);
+        ctx.set_fonts(defs);
+        let rc = Rect::from_min_size(pos2(20.0, 20.0), egui::vec2(73.0, 21.0));
+        let mut clicked = false;
+        let mut t = 0.0;
+        for events in std::iter::once(Vec::new()).chain(passes) {
+            t += 0.05;
+            let raw = egui::RawInput {
+                time: Some(t),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                clicked |= button_light(ui, rc, label, kind, false).clicked();
+            });
+            out.textures_delta.clear();
+        }
+        (clicked, crate::chrome::cues_shown(&ctx))
+    }
+
+    fn key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Alt+C presses "&Close" and underlines the access letters; C alone, Ctrl+Alt+C (AltGr,
+    /// which types) and Alt+C on a disabled button press nothing. Alt+C presses nothing on macOS,
+    /// where Option types letters. Main pressed nothing anywhere: the button's response was
+    /// flagged as a pointer's click, which egui reads only with a pointer click in that pass.
+    #[test]
+    fn alt_and_an_access_letter_press_the_button() {
+        use egui::{Key, Modifiers};
+        let (alt, none) = (Modifiers::ALT, Modifiers::NONE);
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            command: !cfg!(target_os = "macos"),
+            ..Modifiers::ALT
+        };
+        // As X11 sends them (GNOME on Xorg, logged): Alt's key and the modifiers in one pass,
+        // C with Alt held, its text and every release in the next.
+        let x11 = vec![
+            vec![
+                key(Key::AltLeft, true, none),
+                egui::Event::ModifiersChanged(alt),
+            ],
+            vec![
+                key(Key::C, true, alt),
+                egui::Event::Text("c".into()),
+                key(Key::AltLeft, false, alt),
+                egui::Event::ModifiersChanged(none),
+                key(Key::C, false, none),
+            ],
+        ];
+        // All in one pass (a screen reader passes keys on with their release, #328).
+        let one_pass = vec![vec![
+            egui::Event::ModifiersChanged(alt),
+            key(Key::C, true, alt),
+            egui::Event::Text("c".into()),
+            key(Key::C, false, alt),
+            egui::Event::ModifiersChanged(none),
+        ]];
+        let plain = vec![vec![
+            key(Key::C, true, none),
+            egui::Event::Text("c".into()),
+            key(Key::C, false, none),
+        ]];
+        let altgr = vec![vec![
+            egui::Event::ModifiersChanged(ctrl_alt),
+            key(Key::C, true, ctrl_alt),
+            egui::Event::Text("c".into()),
+        ]];
+        let alt_alone = vec![vec![
+            key(Key::AltLeft, true, none),
+            egui::Event::ModifiersChanged(alt),
+            key(Key::AltLeft, false, alt),
+            egui::Event::ModifiersChanged(none),
+        ]];
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(close_by_keys(ButtonKind::Normal, x11), (!mac, !mac), "X11");
+        assert_eq!(
+            close_by_keys(ButtonKind::Normal, one_pass.clone()),
+            (!mac, !mac),
+            "one pass"
+        );
+        assert_eq!(
+            close_by_keys(ButtonKind::Normal, plain),
+            (false, false),
+            "C"
+        );
+        assert_eq!(
+            close_by_keys(ButtonKind::Normal, altgr),
+            (false, false),
+            "AltGr"
+        );
+        assert_eq!(
+            close_by_keys(ButtonKind::Disabled, one_pass),
+            (false, !mac),
+            "disabled"
+        );
+        assert_eq!(
+            close_by_keys(ButtonKind::Normal, alt_alone),
+            (false, !mac),
+            "Alt alone"
+        );
+    }
+
+    /// An access letter of another script, typed with Alt held as X11 sends it (on an Arabic
+    /// layout "ل" is on G's key): Alt is let go in the same pass, so the pass's own modifiers no
+    /// longer hold it and only the key that typed the letter says it was held. Main pressed
+    /// nothing.
+    #[test]
+    fn alt_and_an_access_letter_of_another_script_press_the_button() {
+        use egui::{Key, Modifiers};
+        let (alt, none) = (Modifiers::ALT, Modifiers::NONE);
+        let x11 = vec![
+            vec![
+                key(Key::AltLeft, true, none),
+                egui::Event::ModifiersChanged(alt),
+            ],
+            vec![
+                key(Key::G, true, alt),
+                egui::Event::Text("\u{644}".into()),
+                key(Key::AltLeft, false, alt),
+                egui::Event::ModifiersChanged(none),
+                key(Key::G, false, none),
+            ],
+        ];
+        let typed = vec![vec![
+            key(Key::G, true, none),
+            egui::Event::Text("\u{644}".into()),
+        ]];
+        // "&لصق" (Paste): ل is its access letter.
+        let label = "&\u{644}\u{635}\u{642}";
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(button_by_keys(label, ButtonKind::Normal, x11).0, !mac);
+        assert!(
+            !button_by_keys(label, ButtonKind::Normal, typed).0,
+            "no Alt"
+        );
     }
 
     /// #1084: text selected by dragging stays selected under a right-click on it, and Copy copies

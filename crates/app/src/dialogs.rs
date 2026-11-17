@@ -121,6 +121,7 @@ pub fn keep_theme(
     title: &str,
     dark: bool,
     open: bool,
+    activate: bool,
 ) {
     let theme_key = key.with("theme");
     let shown_key = key.with("shown");
@@ -159,8 +160,10 @@ pub fn keep_theme(
     }
     // Shown (in an earlier frame), once: in front of the other programs' windows, where Windows
     // didn't give it the foreground (#208: Download File Info behind the browser that asked for
-    // it). Not in off-screen test runs, whose windows stay out of the way. Elsewhere the window
-    // manager places a new window and decides on its focus; an app has no say there.
+    // it), or on macOS where `makeKeyAndOrderFront:` alone never activates the app behind the
+    // browser or another program. Not in off-screen test runs, whose windows stay out of the way,
+    // and never for passive notices (Download complete). Elsewhere the window manager places a
+    // new window and decides on its focus; an app has no say there.
     // Looked for in a few frames at most (its title may change meanwhile: a progress window's).
     #[cfg(windows)]
     {
@@ -182,7 +185,30 @@ pub fn keep_theme(
             ctx.data_mut(|d| d.insert_temp(front_key, tries));
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        const TRIES: u32 = 30;
+        let tries = ctx.data(|d| d.get_temp::<u32>(front_key).unwrap_or(0));
+        if activate && shown && !crate::offscreen() && tries < TRIES {
+            let tries = match crate::unix::macos_bring_window_forward(title) {
+                Some(lifted) => {
+                    if lifted {
+                        tracing::info!("window {title:?} shown behind another program's: lifted");
+                    }
+                    ctx.send_viewport_cmd_to(vid, egui::ViewportCommand::Focus);
+                    TRIES
+                }
+                None => {
+                    ctx.request_repaint();
+                    tries + 1
+                }
+            };
+            ctx.data_mut(|d| d.insert_temp(front_key, tries));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = activate;
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = front_key;
     // Belt and braces, once per window and theme (until the window is found): asked every frame,
     // the window's thread waited on DWM, or on a busy window of this process while looking for
@@ -194,7 +220,9 @@ pub fn keep_theme(
         ctx.data_mut(|d| d.insert_temp(caption_key, dark));
     }
     #[cfg(not(windows))]
-    let _ = (title, caption_key);
+    let _ = caption_key;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = title;
 }
 
 /// Whether the window `key` is drawn again after a pass that didn't draw it: egui destroys a
@@ -311,6 +339,13 @@ enum Kind {
     Notice {
         on_top: bool,
     },
+}
+
+/// Interactive dialogs (`Plain` and `Question`) activate MDM and come forward when shown on
+/// macOS; passive `Notice` windows (`Download complete`) stay non-activating so typing in another
+/// program is never interrupted.
+fn dialog_activates_on_open(kind: Kind) -> bool {
+    !matches!(kind, Kind::Notice { .. })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,6 +477,7 @@ fn dialog_window<T>(
             }
         }
     }
+    let activate = dialog_activates_on_open(kind);
     keep_theme(
         ctx,
         ViewportId::from_hash_of(id),
@@ -450,12 +486,14 @@ fn dialog_window<T>(
         // Every dialog follows the mode (the light dialogs too), its caption the theme's surface.
         crate::theme::dark_surface(),
         matches!(out, Outcome::Open),
+        activate,
     );
     // A question takes the focus once it is shown (not while hidden for its theme), and so does
-    // Download File Info outside Windows (#484): asked for from the browser, it opened behind
-    // it. Windows lifts it in keep_theme instead.
+    // Download File Info on Linux (#484): asked for from the browser, it opened behind it.
+    // Windows and macOS lift and focus in `keep_theme` once visible.
     let focused = key.with("focus-sent");
-    let takes_focus = modal || (cfg!(not(windows)) && id == "file-info");
+    let takes_focus =
+        modal || (cfg!(all(not(windows), not(target_os = "macos"))) && id == "file-info");
     if takes_focus && matches!(out, Outcome::Open) && !crate::offscreen() {
         let shown = ctx.data(|d| d.get_temp::<bool>(key.with("shown")).unwrap_or(false));
         if shown && !ctx.data(|d| d.get_temp::<bool>(focused).unwrap_or(false)) {
@@ -865,6 +903,9 @@ impl AddUrl {
 pub(crate) struct PlaceAsk {
     pub dir: PathBuf,
     pub name: String,
+    /// The place the early download already has, when there is one (#597): its own part and
+    /// state files beside exactly this path are its own, not other data.
+    pub own: Option<PathBuf>,
     /// A name MDM gave: numbered on when it is taken there (`naming::destination`). A typed one
     /// only has its folder looked at (its download is numbered as it starts if it is taken).
     pub number: bool,
@@ -881,10 +922,18 @@ pub(crate) struct Found {
 pub(crate) type Look = Arc<dyn Fn(&PlaceAsk) -> Found + Send + Sync>;
 
 /// The engine's naming rules on the disk as it is now; on a thread of its own (it may wait).
+/// Once the old files being deleted in that folder for a new start are gone (a duplicate
+/// overwritten: its new copy takes its name, `naming::clear`).
 fn look(ask: &PlaceAsk) -> Found {
+    mdm_engine::naming::wait_cleared(&ask.dir);
     Found {
         dest: if ask.number {
-            mdm_engine::naming::destination(&ask.dir, &ask.name)
+            match &ask.own {
+                // The download that started early is already writing here: its own part and
+                // state files must not number it (#597).
+                Some(own) if mdm_engine::naming::guess(&ask.dir, &ask.name) == *own => own.clone(),
+                _ => mdm_engine::naming::destination(&ask.dir, &ask.name),
+            }
         } else {
             ask.dir.join(&ask.name)
         },
@@ -901,6 +950,9 @@ fn look(ask: &PlaceAsk) -> Found {
 pub(crate) struct SaveAsPlace {
     look: Look,
     repaint: Option<egui::Context>,
+    /// The early download's own place (#597), if the dialog started one: Save As keeps that
+    /// name even though its `.mdm.part` and `.mdm.json` sit beside it.
+    own: Option<PathBuf>,
     /// The last question, Save As's text it is for (as the answer set it, once taken), and its
     /// answer to come. A new question asks on a thread of its own: one that hangs on a dead
     /// share holds up nothing else.
@@ -918,8 +970,14 @@ impl SaveAsPlace {
         SaveAsPlace {
             look,
             repaint: repaint.cloned(),
+            own: None,
             asking: None,
         }
+    }
+
+    /// The place the download this dialog started early has (#597); None when there is none.
+    pub fn own(&mut self, own: Option<PathBuf>) {
+        self.own = own;
     }
 
     /// `name` in `dir` as MDM names it: Save As's text for now (fitted, not numbered: no wait
@@ -929,6 +987,7 @@ impl SaveAsPlace {
         let ask = PlaceAsk {
             dir: dir.to_owned(),
             name: name.to_owned(),
+            own: self.own.clone(),
             number: true,
         };
         self.ask(ask, &shown);
@@ -994,6 +1053,7 @@ impl SaveAsPlace {
         let ask = PlaceAsk {
             dir: dir.to_owned(),
             name: name.to_string_lossy().into_owned(),
+            own: self.own.clone(),
             number: false,
         };
         self.ask(ask, &save_as.clone());
@@ -1307,6 +1367,12 @@ impl FileInfo {
     /// The chosen destination as an absolute path.
     pub fn dest(&self) -> PathBuf {
         resolve_path(&self.save_as)
+    }
+
+    /// The place the download this dialog started early already has (#597): Save As's look
+    /// keeps its own part and state files from counting its name as taken.
+    pub fn set_early_place(&mut self, dest: Option<PathBuf>) {
+        self.place.own(dest);
     }
 
     pub(crate) fn set_category(&mut self, c: Category) {
@@ -3053,6 +3119,8 @@ pub fn raise(ctx: &egui::Context, viewport: ViewportId) {
     ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Minimized(false));
     // Off-screen test runs never take the focus (main.rs `offscreen`), as the other paths here.
     if !crate::offscreen() {
+        #[cfg(target_os = "macos")]
+        crate::unix::macos_activate_app();
         ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
     }
 }
@@ -4616,6 +4684,33 @@ mod tests {
         assert_eq!(save_as, display_path(&gone.join("a.zip")));
     }
 
+    /// #597: with Start immediately on, the early download's own `.mdm.part` and `.mdm.json`
+    /// sit beside its name. Picking the same folder in Save As keeps that name, so `adopt_early`
+    /// sees no move and the download is not restarted.
+    #[test]
+    fn the_early_downloads_own_part_and_state_keep_its_name() {
+        let d = tempfile::tempdir().unwrap();
+        let own = d.path().join("song.mp3");
+        std::fs::write(mdm_engine::naming::part_path(&own), b"x").unwrap();
+        std::fs::write(mdm_engine::state::state_path(&own), b"{}").unwrap();
+        let mut place = SaveAsPlace::new(None);
+        place.own(Some(own.clone()));
+        let mut save_as = place.name_in(d.path(), "song.mp3");
+        assert_eq!(answered(&mut place, &mut save_as), Some(true));
+        assert_eq!(save_as, display_path(&own));
+        // What `adopt_early` compares: the dialog's place is the item's own, so no restart.
+        assert_eq!(resolve_path(&save_as), own);
+        // Another download's part beside another name still counts.
+        std::fs::write(
+            mdm_engine::naming::part_path(&d.path().join("other.mp3")),
+            b"x",
+        )
+        .unwrap();
+        let mut other = place.name_in(d.path(), "other.mp3");
+        assert_eq!(answered(&mut place, &mut other), Some(true));
+        assert_eq!(other, display_path(&d.path().join("other (1).mp3")));
+    }
+
     /// #1088: a name chosen in the Save dialog that a file there already has is taken as a typed
     /// one: Save As keeps it as chosen (not renumbered under the user), its folder looked at; the
     /// download numbers it as it starts (`Item::number_at_start`), so nothing is overwritten.
@@ -4766,5 +4861,13 @@ mod tests {
             next = ensure_folder_with(&ctx, &mut gate, Outcome::Open, &folder, |_| true);
         }
         assert!(matches!(next, Outcome::Done(9)));
+    }
+
+    #[test]
+    fn passive_notices_never_activate_on_open() {
+        assert!(dialog_activates_on_open(Kind::Plain));
+        assert!(dialog_activates_on_open(Kind::Question));
+        assert!(!dialog_activates_on_open(Kind::Notice { on_top: true }));
+        assert!(!dialog_activates_on_open(Kind::Notice { on_top: false }));
     }
 }

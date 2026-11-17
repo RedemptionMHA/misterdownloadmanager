@@ -30,7 +30,8 @@
 // clear of the page's controls, #421), feeds (a video in a feed sends its post, its own file, or
 // nothing and says so, never the feed: sample pages served at LinkedIn's, Facebook's, X's,
 // Instagram's, Reddit's, TikTok's, Vimeo's, Dailymotion's addresses, #689), preview (the video button kept over a hover-to-play
-// preview the page stopped as the pointer went to it, #503), steady (the video button keeping one place over
+// preview the page stopped as the pointer went to it, #503), ytpreview (the same over YouTube's own
+// preview, a click sending the preview's video, not the one its main player watched last, #1271), steady (the video button keeping one place over
 // a preview that grows and shows its own buttons while hovered, #560), player (one place over a
 // player whose settings button comes and goes as the pointer moves, #899), csp (the video button
 // under a strict CSP), hls (the stream a player loaded), streams (HLS and DASH players handed over
@@ -48,8 +49,8 @@
 // real video page, E2E_VIDEO_PAGE, and the line E2E_VIDEO_PICK downloaded: off by default), video (shown,
 // clicked, dragged, kept; "never on the site" in the last browser; the button's clicks go through
 // its menu's "Open in…" to the Download video window, as in csp, hls, streams, sniffed and
-// inplace), panelOptions (the button follows Options in an open tab: off, on, the site listed;
-// #532), videoFocus (mouse idle/fullscreen and keyboard focus, #480), fullscreen (one
+// inplace), panelOptions (the button follows Options in an open tab: off, on, its size, the site
+// listed; #532, #1278), videoFocus (mouse idle/fullscreen and keyboard focus, #480), fullscreen (one
 // button over a video in full screen, the page's or the player's, and after the extension was
 // updated while it showed, #336), reconnect (a tab opened while
 // the host couldn't start gets the button once it can, no reload; then MDM started by a click, and
@@ -1604,8 +1605,16 @@ async function panelSettings(change) {
   await startApp();
 }
 
+// Whether the button's pill is its round form (`compact`: the logo, the arrow, the ✕), and its width.
+const PILL_COMPACT = `function () {
+  const p = this.querySelector ? this.querySelector(".pill") : null;
+  return p ? JSON.stringify({ compact: p.classList.contains("compact"), w: p.getBoundingClientRect().width }) : null;
+}`;
+
 // #532: the button follows Options in a tab already open (no reload: YouTube never reloads),
-// switched off, on again, and off on the site; and after a reload.
+// switched off, on again, and off on the site; and after a reload. #1278: Button size Compact
+// makes it the round button over a large video in the open tab, Full puts its words back.
+// E2E_SHOTS (Chromium): <lang>-<scheme>-button-full.png and -button-compact.png, the video with it.
 async function videoButtonFollowsOptions(session) {
   const page = `${LAB}/page?video=${encodeURIComponent("/gen/1M/clip.mp4")}`;
   await session.navigate(page);
@@ -1629,13 +1638,46 @@ async function videoButtonFollowsOptions(session) {
     await away();
     if (!(await hover(session, v))) throw new Error("switched on again: no button in the open tab");
     done.push("on again: back in the open tab");
+    // #1278: Button size. Full: its words over this 640 px video; Compact: the round button.
+    const shots = process.env.E2E_SHOTS && session.shot ? path.resolve(process.env.E2E_SHOTS) : "";
+    const tag = `${process.env.E2E_LANG || "en"}-${process.env.E2E_COLOR_SCHEME || "system"}`;
+    const size = async (want) => {
+      // Over the video until the button's form is the one wanted (the page asks the app again
+      // when its answer is older than 5 s).
+      return until(`the button ${want ? "compact" : "full"}`, 15000, async () => {
+        await hover(session, v);
+        const p = await session.pill(PILL_COMPACT);
+        return p && p.compact === want ? p : null;
+      });
+    };
+    const shoot = async (name) => {
+      if (!shots) return;
+      await sleep(400);
+      await session.shot(path.join(shots, `${tag}-button-${name}.png`), { l: v.l - 16, t: v.t - 16, r: v.r + 16, b: Math.min(v.b, v.t + 140) + 16 });
+    };
+    const full = await size(false);
+    await shoot("full");
+    await panelSettings({ video_panel_compact: true });
+    await away();
+    const small = await size(true);
+    if (!(small.w < full.w)) throw new Error(`Compact: the round button (${small.w} px) is no smaller than the full one (${full.w} px)`);
+    await shoot("compact");
+    done.push(`Compact: the round button in the open tab (${Math.round(small.w)} px, Full ${Math.round(full.w)} px)`);
+    await session.mouse(5, 5);
+    await session.navigate(page);
+    await size(true);
+    done.push("and after a reload");
+    await panelSettings({ video_panel_compact: false });
+    await away();
+    await size(false);
+    done.push("Full again: its words back in the open tab");
     await panelSettings({ video_panel_sites: "127.0.0.1" });
     await away();
     if (await hover(session, v)) throw new Error("the site listed in Options: the button still shows in the open tab");
     done.push("the site listed: gone in the open tab");
   } finally {
     await session.mouse(5, 5);
-    await panelSettings({ video_panel: true, video_panel_sites: "" });
+    await panelSettings({ video_panel: true, video_panel_sites: "", video_panel_compact: false });
   }
   return done.join("; ");
 }
@@ -2741,6 +2783,61 @@ const CASES = {
     if (address !== `${LAB}/gen/1M/clip.mp4`) throw new Error(`the video window got ${address}`);
     await t.session.mouse(5, 5);
     return `${Math.abs(first.l - b.l) > 2 || Math.abs(first.t - b.t) > 2 ? "moved" : "stayed"} off the preview's sound button, at ${Math.round(b.l - v.l)},${Math.round(b.t - v.t)}; then still for ${seen.length} looks (8 steps there, 2.5 s on it while the preview shrank and hid its button), sent ${address.replace(LAB, "")}`;
+  },
+
+  // #1271: YouTube's own hover preview, as its home page has it. The preview plays in a player
+  // of its own (.html5-video-player) inside the card's link, and stops as the pointer leaves the
+  // thumbnail for the button: YouTube hides it in a container of no size. Its main player sits
+  // under the page with no box (at the window's corner), still holding the video watched last.
+  // A sample page served at www.youtube.com (nothing from YouTube itself), both players
+  // answering as YouTube's do (getVideoData). The button stays while the pointer is on it, and a
+  // click sends the preview's video, never the one watched last.
+  async ytpreview(t) {
+    const PREVIEW = "mdmPreview1";
+    const WATCHED = "mdmWatched1";
+    const html = `<!doctype html><meta charset="utf-8"><title>YouTube</title>
+<style>body{margin:0;font:14px sans-serif}#player{display:none}.card{position:absolute;left:120px;top:100px;width:480px}
+.thumb{display:block;position:relative;width:480px;height:270px;border-radius:12px;overflow:hidden;background:linear-gradient(135deg,#3b6ea5,#a7c7e7)}
+.preview{position:absolute;inset:0}.preview.off{display:none}video{display:block;width:100%;height:100%;background:#0b1e33}</style>
+<div id="player"><div id="movie_player" class="html5-video-player"><video></video></div></div>
+<div class="card"><a class="thumb" href="/watch?v=${PREVIEW}"><div class="preview off"><div id="inline-preview-player" class="html5-video-player"><video muted></video></div></div></a>
+<p><a href="/watch?v=${PREVIEW}">A test clip</a></p></div>
+<script>
+document.getElementById("movie_player").getVideoData = () => ({ video_id: "${WATCHED}" });
+document.getElementById("inline-preview-player").getVideoData = () => ({ video_id: "${PREVIEW}" });
+const thumb = document.querySelector(".thumb");
+const preview = document.querySelector(".preview");
+thumb.addEventListener("mouseenter", () => { preview.classList.remove("off"); document.body.dataset.preview = "playing"; });
+thumb.addEventListener("mouseleave", () => { preview.classList.add("off"); document.body.dataset.preview = "stopped"; });
+</script>`;
+    await t.session.serve(["www.youtube.com"], (url) =>
+      new URL(url).pathname === "/" ? { status: 200, type: "text/html; charset=utf-8", body: html } : { status: 404, type: "text/plain", body: "not a sample page" },
+    );
+    await t.session.navigate("https://www.youtube.com/");
+    const thumb = await rect(t.session, ".thumb");
+    const b = await hover(t.session, thumb);
+    if (!b) throw new Error("no button over the preview");
+    // Onto the button: YouTube stops its preview.
+    await t.session.mouse(b.l + 14, (b.t + b.b) / 2);
+    await until("the page's preview stopped", 3000, () => t.session.evaluate(`document.body.dataset.preview === "stopped"`));
+    await sleep(2000);
+    // E2E_YTPREVIEW_SHOT: a folder for a PR's pictures: the page with the preview stopped and the
+    // pointer on the button, and the Download video window the click opened.
+    const shots = process.env.E2E_YTPREVIEW_SHOT || "";
+    if (shots) fs.mkdirSync(shots, { recursive: true });
+    if (shots && t.session.screenshot) await t.session.screenshot(path.join(shots, `${t.name}-page.png`));
+    const kept = await rect(t.session, "mdm-video-button");
+    if (!kept) throw new Error("the button went with the preview");
+    // Where it was: at the thumbnail's top right, its end against the edge (its grip, shown
+    // under the pointer, widens it to the left).
+    near(kept.r, b.r, "kept, right edge");
+    near(kept.t, b.t, "kept, top");
+    const address = await clickButton(t.session, kept, shots && path.join(shots, `${t.name}-window.png`));
+    if (address === `https://www.youtube.com/watch?v=${WATCHED}`) throw new Error("the video window got the video watched last, not the preview's");
+    if (address !== `https://www.youtube.com/watch?v=${PREVIEW}`) throw new Error(`the video window got ${address}`);
+    await t.session.mouse(5, 5);
+    await until("the button gone after the pointer left", 3000, async () => !(await rect(t.session, "mdm-video-button")));
+    return `kept over the stopped preview, sent watch?v=${PREVIEW} (not the main player's ${WATCHED}), gone after`;
   },
 
   // #899: a site's player shows its own settings button at the top right while the pointer moves

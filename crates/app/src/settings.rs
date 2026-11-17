@@ -185,6 +185,10 @@ pub struct Settings {
     /// sites it stays off (space separated; the native host reads both, mdm_ipc::capture).
     pub video_panel: bool,
     pub video_panel_sites: String,
+    /// General → Download panels → Button size (#1278): Compact shows the button as its round
+    /// form (the logo, the arrow, the ✕) over every video; Full (false, the default) shows its
+    /// words where they fit and the round form only on a small video. The host reads it too.
+    pub video_panel_compact: bool,
     /// General: also take the listed types the browser would open itself (a PDF in its viewer,
     /// an MP3 in its player); holding Alt while clicking leaves one to the browser.
     pub capture_opened: bool,
@@ -234,6 +238,10 @@ pub struct Settings {
     /// Sealed on disk like Sites Logins' passwords (`sealed`); a plain one from before still reads.
     #[serde(with = "sealed")]
     pub proxy_pass: String,
+    /// Options → Archives → Archive passwords (#37): tried in this order on an encrypted archive
+    /// before its password is asked, one a line. Kept in the keychain as the other passwords.
+    #[serde(with = "sealed")]
+    pub archive_passwords: String,
     pub proxy_http: bool,
     pub proxy_https: bool,
     pub proxy_ftp: bool,
@@ -454,6 +462,7 @@ impl Default for Settings {
             excluded_addresses: Vec::new(),
             video_panel: true,
             video_panel_sites: String::new(),
+            video_panel_compact: false,
             capture_opened: true,
             capture_min_kb: 0,
             regional: crate::regional::Regional::default(),
@@ -480,6 +489,7 @@ impl Default for Settings {
             proxy_port: String::new(),
             proxy_user: String::new(),
             proxy_pass: String::new(),
+            archive_passwords: String::new(),
             proxy_http: false,
             proxy_https: false,
             proxy_ftp: false,
@@ -595,6 +605,17 @@ impl Settings {
             },
             &self.proxy_pass,
         );
+        disk.archive_passwords = kept(
+            "archives/passwords".into(),
+            &|| {
+                format!(
+                    "Mister Download Manager: {}",
+                    // i18n: the list of archive passwords in the system's keychain (Credential Manager, the keyring): its name there
+                    crate::i18n::t("archive passwords")
+                )
+            },
+            &self.archive_passwords,
+        );
         for (a, d) in self.debrid_accounts.iter().zip(&mut disk.debrid_accounts) {
             d.secret = kept(
                 format!("debrid/{}", a.id),
@@ -619,6 +640,23 @@ impl Settings {
         disk
     }
 
+    /// Options → Archives' passwords, in the order they are tried.
+    pub fn archive_password_list(&self) -> Vec<String> {
+        password_lines(&self.archive_passwords)
+    }
+
+    /// `password` first in that list (added, or moved up): it opened an archive, or the user
+    /// asked to remember it.
+    pub fn remember_archive_password(&mut self, password: &str) {
+        if password.is_empty() || password.contains(['\n', '\r']) {
+            return;
+        }
+        let mut list = self.archive_password_list();
+        list.retain(|p| p != password);
+        list.insert(0, password.to_owned());
+        self.archive_passwords = list.join("\n");
+    }
+
     /// Options → Archives' folder choice, for mdm-extract.
     pub fn extract_into(&self) -> mdm_extract::Subfolder {
         match self.extract_subfolder {
@@ -627,6 +665,17 @@ impl Settings {
             _ => mdm_extract::Subfolder::Smart,
         }
     }
+}
+
+/// The passwords of a list typed one a line: blank lines out, each once, spaces kept (a password
+/// may have them).
+pub fn password_lines(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// FNV-1a: a stable hash (std's may change between builds), for keychain keys.
@@ -1182,6 +1231,28 @@ mod tests {
         assert!(!s.keep_category_dir(Category::Video, chosen, downloads));
     }
 
+    /// #1278: the video button's size is Full unless Compact was chosen, kept across a save,
+    /// and read by the native host under the same name (mdm_ipc::capture::CaptureRules).
+    #[test]
+    fn the_video_buttons_size_is_saved_and_read_by_the_host() {
+        use super::Settings;
+        assert!(!Settings::default().video_panel_compact, "Full by default");
+        let old: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!old.video_panel_compact, "settings saved before it: Full");
+        let s = Settings {
+            video_panel_compact: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_value(&s).unwrap();
+        let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+        assert!(again.video_panel_compact);
+        let rules: mdm_ipc::capture::CaptureRules = serde_json::from_value(saved).unwrap();
+        assert!(rules.video_panel_compact);
+        let rules: mdm_ipc::capture::CaptureRules =
+            serde_json::from_value(serde_json::to_value(Settings::default()).unwrap()).unwrap();
+        assert!(!rules.video_panel_compact);
+    }
+
     #[test]
     fn a_dialog_keeps_what_changed_elsewhere_meanwhile() {
         let from = super::Settings::default();
@@ -1531,6 +1602,7 @@ pub(crate) mod sealed {
         fn the_proxy_password_and_debrid_secrets_are_sealed_on_disk() {
             let s = crate::settings::Settings {
                 proxy_pass: "proxy-s3cret".into(),
+                archive_passwords: "zip-s3cret\nother".into(),
                 debrid_accounts: vec![crate::settings::DebridAccount {
                     id: 1,
                     user: "me".into(),
@@ -1541,10 +1613,15 @@ pub(crate) mod sealed {
             };
             let json = serde_json::to_string(&s).unwrap();
             if cfg!(windows) {
-                assert!(!json.contains("proxy-s3cret") && !json.contains("rd-s3cret"));
+                assert!(
+                    !json.contains("proxy-s3cret")
+                        && !json.contains("rd-s3cret")
+                        && !json.contains("zip-s3cret")
+                );
             }
             let back: crate::settings::Settings = serde_json::from_str(&json).unwrap();
             assert_eq!(back.proxy_pass, "proxy-s3cret");
+            assert_eq!(back.archive_password_list(), vec!["zip-s3cret", "other"]);
             assert!(back.debrid_accounts[0].account().is_some());
             // Never in a debug dump either.
             assert!(!format!("{:?}", back.debrid_accounts).contains("rd-s3cret"));

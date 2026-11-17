@@ -789,6 +789,11 @@
   function fitsWords(videoWidth, fullWidth, inset) {
     return videoWidth >= 360 && fullWidth <= videoWidth - 2 * inset;
   }
+  // The round button (the logo, the arrow, the ✕) or the whole one: always round when Options →
+  // Download panels → Button size is Compact (`always`, #1278); else round where its words don't fit.
+  function compactFor(always, videoWidth, fullWidth, inset) {
+    return Boolean(always) || !fitsWords(videoWidth, fullWidth, inset);
+  }
   // ---- the button's words: end.
 
   // The address this page first loaded at (`download`: a page that moves in place keeps its first
@@ -810,6 +815,9 @@
   let asking = null;
   let never = false;
   let placed = false;
+  // Options → Download panels → Button size is Compact (#1278): the round button over every video.
+  // It comes with the app's answer, so a change in Options reaches a page already open with it.
+  let compactAlways = false;
   // Hidden while the page is fullscreen, when chosen in the popup (off: it shows, as now).
   let hideFullscreen = false;
   try {
@@ -1528,9 +1536,10 @@ button:focus-visible { outline: none; }
 
   function position() {
     if (!video) return;
-    // A small video, or one its words wouldn't fit: the round button and its menu only.
+    // A small video, one its words wouldn't fit, or Compact chosen in Options: the round button
+    // and its menu only.
     const vr = held ? held.r : video.getBoundingClientRect();
-    pill.classList.toggle("compact", !fitsWords(vr.width, fullWidth, INSET));
+    pill.classList.toggle("compact", compactFor(compactAlways, vr.width, fullWidth, INSET));
     const { r, w, roomX, roomY } = rects();
     // The pointer on it (or its menu open): it stays where it is, whatever the video does
     // meanwhile. A preview that grows while the pointer is over it and shrinks back when the
@@ -1772,6 +1781,9 @@ button:focus-visible { outline: none; }
     asking = asking || send({ type: "panel" }).then(async (r) => {
       allowed = !never && Boolean(r && r.on);
       askedAt = Date.now();
+      const wasCompact = compactAlways;
+      compactAlways = Boolean(r && r.compact);
+      if (allowed && compactAlways !== wasCompact && video) position();
       // Switched off meanwhile: gone now, unless the menu, a drag or its "Turn on" has it in hand.
       if (!allowed && video && !menuOpen && !dragging && !(status && status.state === "off")) {
         video = null;
@@ -1819,8 +1831,14 @@ button:focus-visible { outline: none; }
 
   // ---- acting ---------------------------------------------------------------------------------
   // The middle of the video: where the background asks the page's own player what it plays.
-  function middle(v) {
+  // A video with no box on the screen any more (a hover preview the page stopped as the pointer
+  // went to the button, #1271: taken out, or hidden in a container of no size) is at no point:
+  // its middle would be the window's corner, where YouTube keeps its main player, whose answer
+  // is the video watched last, not the preview's. The point it was at when the click was taken
+  // (`was`) instead.
+  function middle(v, was) {
     const box = v.getBoundingClientRect();
+    if (!v.isConnected || !(box.width > 0 && box.height > 0)) return was;
     return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
   }
 
@@ -1917,7 +1935,7 @@ button:focus-visible { outline: none; }
   async function useWindow(j, { direct = false, words = "" } = {}) {
     if (!firstWindow(j)) return;
     // Where the video is now, for the background to ask the page's player there.
-    const r = await send({ type: "video", ...j.asked, ...(direct ? { direct: true } : {}), ...(j.video.isConnected ? { at: middle(j.video) } : {}) });
+    const r = await send({ type: "video", ...j.asked, ...(direct ? { direct: true } : {}), at: middle(j.video, j.asked.at) });
     if (r.gone) return;
     if (r.ok) {
       lastShow = r.show || "";
@@ -2359,7 +2377,9 @@ button:focus-visible { outline: none; }
   });
   document.addEventListener("fullscreenchange", () => {
     if (!video) return;
-    if (hideFullscreen && document.fullscreenElement) hide(true);
+    // Entering full screen: out of the way at once, as the player's own controls are; the
+    // pointer's next move brings it back. Leaving it: shown again, as before.
+    if (document.fullscreenElement) hide(true);
     else show(video);
   });
   addEventListener("blur", () => hide());

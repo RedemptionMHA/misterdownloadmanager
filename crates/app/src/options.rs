@@ -37,8 +37,9 @@ enum Sub {
     Login(Option<usize>, String, String, String),
     /// Connection → New / Edit exception: (row, server, number).
     Exception(Option<usize>, String, String),
-    /// General → Download panels → Edit...: (the button over videos on, the sites it stays off).
-    Panels(bool, String, String),
+    /// General → Download panels → Edit...: (the button over videos on, its size Compact
+    /// (#1278), the sites it stays off, what Export / Import said).
+    Panels(bool, bool, String, String),
     /// General → Keys...: (also take the files the browser would open).
     Keys(bool),
     /// Downloads → Customize "Download progress" dialog → Edit... (#1041): (show it when a
@@ -56,6 +57,8 @@ enum Sub {
     Account(AccountEdit),
     /// Remote → Pair a device...: the code shown, until a device pairs or it is closed.
     Pair,
+    /// Archives → Archive passwords...: one password per line (#37).
+    Passwords(String),
 }
 
 /// Options → Remote's page number (the tabs' numbers).
@@ -281,6 +284,7 @@ impl OptionsDialog {
     pub fn with_panels(mut self) -> Self {
         self.sub = Some(Sub::Panels(
             self.s.video_panel,
+            self.s.video_panel_compact,
             self.s.video_panel_sites.clone(),
             String::new(),
         ));
@@ -853,6 +857,7 @@ impl OptionsDialog {
         {
             self.sub = Some(Sub::Panels(
                 self.s.video_panel,
+                self.s.video_panel_compact,
                 self.s.video_panel_sites.clone(),
                 String::new(),
             ));
@@ -2399,7 +2404,7 @@ impl OptionsDialog {
         );
         let s = &mut self.s;
         // i18n: Options → Archives: group box title
-        group(ui, o, 16.0, 92.0, 392.0, 228.0, "Archives");
+        group(ui, o, 16.0, 92.0, 392.0, 243.0, "Archives");
         winui::checkbox_light(
             ui,
             o + vec2(30.0, 110.0),
@@ -2424,7 +2429,7 @@ impl OptionsDialog {
         text(
             &p,
             o.x + 30.0,
-            o.y + 174.0,
+            o.y + 166.0,
             // i18n: Options → Archives: a label before the list of where extracted files go
             crate::i18n::t("What an archive holds goes:"),
             LIGHT_TEXT(),
@@ -2439,7 +2444,7 @@ impl OptionsDialog {
         ];
         if let Some(i) = winui::combo_light(
             ui,
-            r(o, 30.0, 181.0, 364.0, 21.0),
+            r(o, 30.0, 173.0, 364.0, 21.0),
             &INTO,
             s.extract_subfolder.min(2) as usize,
             true,
@@ -2450,7 +2455,7 @@ impl OptionsDialog {
         winui::paragraph(
             &p,
             o.x + 30.0,
-            o.y + 226.0,
+            o.y + 218.0,
             crate::i18n::t(
                 "ZIP, 7Z, RAR, TAR, GZ and XZ; a split archive (.part1.rar, .7z.001) once\nevery volume is in. A file there already is kept: the new one is numbered.",
             ),
@@ -2490,7 +2495,7 @@ impl OptionsDialog {
             ui,
             &p,
             o.x + 30.0,
-            o.y + 272.0,
+            o.y + 264.0,
             &rar,
             ink,
             o.x + 400.0,
@@ -2499,7 +2504,7 @@ impl OptionsDialog {
         let has_hatchzip = self.hatch_zip.is_some();
         winui::checkbox_light(
             ui,
-            o + vec2(30.0, 294.0),
+            o + vec2(30.0, 284.0),
             &mut s.extract_in_place,
             if has_hatchzip {
                 // i18n: Options → Archives check box: HatchZip (a program's name) removes the archive while extracting it, so only the extracted files need disk space
@@ -2510,11 +2515,42 @@ impl OptionsDialog {
             },
             has_hatchzip,
         );
+        // The passwords tried on an encrypted archive before it is asked (#37).
+        let (pw_x, pw_w) = winui::button_row_from_left(
+            &p,
+            &[("Archive passwords...", 30.0, 150.0)],
+            0.0,
+            389.0,
+            300.0,
+        )[0];
+        // i18n: Options → Archives: button: edit the list of passwords tried on encrypted archives
+        if winui::button_light(
+            ui,
+            r(o, pw_x, 304.0, pw_w, 21.0),
+            "Archive passwords...",
+            ButtonKind::Normal,
+            false,
+        )
+        .clicked()
+        {
+            self.sub = Some(Sub::Passwords(s.archive_passwords.clone()));
+        }
+        let saved = s.archive_password_list().len() as u64;
+        if saved > 0 {
+            text(
+                &p,
+                o.x + pw_x + pw_w + 10.0,
+                o.y + 320.0,
+                // i18n: Options → Archives: beside the Archive passwords button: how many are saved
+                &crate::i18n::tn(saved, "{n} saved", "{n} saved"),
+                LIGHT_DISABLED(),
+            );
+        }
         // i18n: Options → Archives: group box title
-        group(ui, o, 16.0, 320.0, 392.0, 132.0, "Link grabber");
+        group(ui, o, 16.0, 335.0, 392.0, 128.0, "Link grabber");
         winui::checkbox_light(
             ui,
-            o + vec2(30.0, 338.0),
+            o + vec2(30.0, 353.0),
             &mut s.grabber_check,
             // i18n: Options → Archives → Link grabber check box (IDM's Download all links looks every link up)
             "Look links up when they arrive (name, size, online)",
@@ -2522,14 +2558,14 @@ impl OptionsDialog {
         );
         winui::checkbox_light(
             ui,
-            o + vec2(30.0, 362.0),
+            o + vec2(30.0, 377.0),
             &mut s.grabber_hide_pages,
             "Hide web pages",
             true,
         );
         winui::checkbox_light(
             ui,
-            o + vec2(30.0, 386.0),
+            o + vec2(30.0, 401.0),
             &mut s.cnl_on,
             // i18n: Options → Archives → Link grabber check box: Click'n'Load, a link site's button that sends its links to a program on this computer (port 9666, as JDownloader)
             "Accept Click'n'Load from web pages (port 9666)",
@@ -2538,7 +2574,7 @@ impl OptionsDialog {
         winui::paragraph(
             &p,
             o.x + 30.0,
-            o.y + 418.0,
+            o.y + 429.0,
             crate::i18n::t(
                 "Tasks → Link grabber, or the browser's \"Download all links\": a split\narchive's volumes are one package, the other links of a page another.",
             ),
@@ -3468,13 +3504,13 @@ impl OptionsDialog {
                     Outcome::Closed => {}
                 }
             }
-            Sub::Panels(mut on, mut sites, mut said) => {
+            Sub::Panels(mut on, mut compact, mut sites, mut said) => {
                 let out = window(
                     ctx,
                     "opt-panels",
                     // i18n: window title: the download button the extension shows over videos
                     "Download panels",
-                    [380.0, 190.0],
+                    [380.0, 241.0],
                     false,
                     LIGHT_BG(),
                     |ui, o| {
@@ -3486,30 +3522,72 @@ impl OptionsDialog {
                             "Show a download button over videos in browsers",
                             true,
                         );
+                        // Its size (#1278): Full, its words where they fit; Compact, the round
+                        // button over every video.
+                        let shade = if on { LIGHT_TEXT() } else { LIGHT_DISABLED() };
+                        // i18n: Options → Download panels: the size of the download button over videos, chosen after it (Full / Compact)
+                        let size_label = crate::i18n::t("Button size:");
+                        winui::text_in_window(ui, &p, o.x + 30.0, o.y + 52.0, size_label, shade);
+                        // i18n: Options → Download panels → Button size: the button with its words ("Download video", the quality) where they fit (the default)
+                        let full_caption = crate::i18n::mark("Full");
+                        let full_x = (30.0 + winui::text_width(&p, size_label) + 12.0).max(110.0);
+                        let compact_x = full_x
+                            + 16.0
+                            + winui::text_width(&p, crate::i18n::t(full_caption))
+                            + 20.0;
+                        let full = winui::radio_light(
+                            ui,
+                            o + vec2(full_x, 42.0),
+                            !compact,
+                            full_caption,
+                            on,
+                        );
+                        let small = winui::radio_light(
+                            ui,
+                            o + vec2(compact_x, 42.0),
+                            compact,
+                            // i18n: Options → Download panels → Button size: only the round button (the logo, the arrow, the close mark) over every video
+                            "Compact",
+                            on,
+                        );
+                        match winui::radio_keys(ui, &[full.clone(), small.clone()]) {
+                            Some(i) => compact = i == 1,
+                            None if full.clicked() => compact = false,
+                            None if small.clicked() => compact = true,
+                            None => {}
+                        }
                         winui::text_in_window(
                             ui,
                             &p,
                             o.x + 14.0,
-                            o.y + 55.0,
+                            o.y + 83.0,
                             crate::i18n::t("Never show it on these sites:"),
-                            if on { LIGHT_TEXT() } else { LIGHT_DISABLED() },
+                            shade,
                         );
                         multiline(
                             ui,
-                            r(o, 14.0, 62.0, 352.0, 55.0),
+                            r(o, 14.0, 90.0, 352.0, 55.0),
                             &mut sites,
                             "panel-sites",
                             on,
                         );
-                        winui::text_in_window(
-                            ui,
+                        // On a row of its own, the list's width: beside Export... and Import... it
+                        // ran under them (English already, German further).
+                        let hint = crate::i18n::t(
+                            // i18n: under Download panels site exclusions list
+                            "(separate by spaces; * matches anything)",
+                        );
+                        let (rect, cut) = winui::text_fit(
                             &p,
                             o.x + 14.0,
-                            o.y + 133.0,
-                            // i18n: under Download panels site exclusions list
-                            crate::i18n::t("(separate by spaces; * matches anything)"),
+                            o.y + 161.0,
+                            hint,
                             LIGHT_TEXT(),
+                            o.x + 366.0,
                         );
+                        if cut {
+                            winui::full_on_hover(ui, rect, "opt-panels-hint", hint);
+                        }
                         // The list as a file, to keep or carry to a new installation (#424).
                         let [export_at, import_at] = winui::button_row(
                             &p,
@@ -3522,7 +3600,7 @@ impl OptionsDialog {
                         };
                         if winui::button_light(
                             ui,
-                            r(o, export_at.0, 128.0, export_at.1, 21.0),
+                            r(o, export_at.0, 172.0, export_at.1, 21.0),
                             "Export...",
                             ButtonKind::Normal,
                             false,
@@ -3539,7 +3617,7 @@ impl OptionsDialog {
                         }
                         if winui::button_light(
                             ui,
-                            r(o, import_at.0, 128.0, import_at.1, 21.0),
+                            r(o, import_at.0, 172.0, import_at.1, 21.0),
                             "Import...",
                             ButtonKind::Normal,
                             false,
@@ -3591,7 +3669,7 @@ impl OptionsDialog {
                             let (rect, cut) = winui::text_fit(
                                 &p,
                                 o.x + 14.0,
-                                o.y + 163.0,
+                                o.y + 187.0,
                                 &said,
                                 LIGHT_TEXT(),
                                 o.x + 205.0,
@@ -3600,13 +3678,14 @@ impl OptionsDialog {
                                 winui::full_on_hover(ui, rect, "opt-panels-said", &said);
                             }
                         }
-                        ok_cancel(ui, o, 212.0, 157.0, true)
+                        ok_cancel(ui, o, 212.0, 208.0, true)
                     },
                 );
                 match out {
-                    Outcome::Open => self.sub = Some(Sub::Panels(on, sites, said)),
+                    Outcome::Open => self.sub = Some(Sub::Panels(on, compact, sites, said)),
                     Outcome::Done(()) => {
                         self.s.video_panel = on;
+                        self.s.video_panel_compact = compact;
                         self.s.video_panel_sites =
                             sites.split_whitespace().collect::<Vec<_>>().join(" ");
                     }
@@ -3662,6 +3741,47 @@ impl OptionsDialog {
                         .signin
                         .stop
                         .store(true, std::sync::atomic::Ordering::Relaxed),
+                }
+            }
+            Sub::Passwords(mut list) => {
+                let out = window(
+                    ctx,
+                    "opt-archive-passwords",
+                    // i18n: window title: the passwords tried on encrypted archives
+                    "Archive passwords",
+                    [420.0, 230.0],
+                    false,
+                    LIGHT_BG(),
+                    |ui, o| {
+                        let p = ui.painter().clone();
+                        winui::paragraph(
+                            &p,
+                            o.x + 14.0,
+                            o.y + 20.0,
+                            // i18n: Archive passwords window: how the list is used
+                            crate::i18n::t(
+                                "One password per line, tried in this order on an encrypted archive before MDM asks. The one that fits moves to the top.",
+                            ),
+                            LIGHT_TEXT(),
+                            o.x + 406.0,
+                            14.0,
+                        );
+                        multiline(
+                            ui,
+                            r(o, 14.0, 52.0, 392.0, 122.0),
+                            &mut list,
+                            "archive-passwords",
+                            true,
+                        );
+                        ok_cancel(ui, o, 252.0, 192.0, true)
+                    },
+                );
+                match out {
+                    Outcome::Open => self.sub = Some(Sub::Passwords(list)),
+                    Outcome::Done(()) => {
+                        self.s.archive_passwords = settings::password_lines(&list).join("\n");
+                    }
+                    Outcome::Closed => {}
                 }
             }
             Sub::Addresses(mut list) => {
